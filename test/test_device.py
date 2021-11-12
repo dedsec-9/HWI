@@ -35,7 +35,7 @@ class DeviceEmulator():
 
 def start_bitcoind(bitcoind_path):
     datadir = tempfile.mkdtemp()
-    bitcoind_proc = subprocess.Popen([bitcoind_path, '-regtest', '-datadir=' + datadir, '-noprinttoconsole', '-fallbackfee=0.0002'])
+    bitcoind_proc = subprocess.Popen([bitcoind_path, '-regtest', '-datadir=' + datadir, '-noprinttoconsole', '-fallbackfee=0.0002', '-keypool=1'])
 
     def cleanup_bitcoind():
         bitcoind_proc.kill()
@@ -103,13 +103,13 @@ class DeviceTestCase(unittest.TestCase):
             result = proc.communicate()
             return json.loads(result[0].decode())
         elif self.interface == 'bindist':
-            proc = subprocess.Popen(['../dist/hwi ' + ' '.join(cli_args)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, shell=True)
+            proc = subprocess.Popen(['../dist/hwi ' + ' '.join(cli_args)], stdout=subprocess.PIPE, shell=True)
             result = proc.communicate()
             return json.loads(result[0].decode())
         elif self.interface == 'stdin':
             args = [f'"{arg}"' for arg in args]
             input_str = '\n'.join(args) + '\n'
-            proc = subprocess.Popen(['hwi', '--stdin'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            proc = subprocess.Popen(['hwi', '--stdin'], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
             result = proc.communicate(input_str.encode())
             return json.loads(result[0].decode())
         else:
@@ -285,6 +285,8 @@ class TestSignTx(DeviceTestCase):
             # Just do the normal signing process to test "all inputs" case
             sign_res = self.do_command(self.dev_args + ['signtx', psbt['psbt']])
             finalize_res = self.wrpc.finalizepsbt(sign_res['psbt'])
+            self.assertTrue(sign_res["signed"])
+            self.assertTrue(finalize_res["complete"])
         else:
             # Sign only input one on first pass
             # then rest on second pass to test ability to successfully
@@ -300,9 +302,9 @@ class TestSignTx(DeviceTestCase):
             # Single input PSBTs will be fully signed by first signer
             for psbt_input in first_psbt.inputs[1:]:
                 for pubkey, path in psbt_input.hd_keypaths.items():
-                    psbt_input.hd_keypaths[pubkey] = KeyOriginInfo(b"\x00\x00\x00\x00", path.path)
+                    psbt_input.hd_keypaths[pubkey] = KeyOriginInfo(b"\x00\x00\x00\x01", path.path)
             for pubkey, path in second_psbt.inputs[0].hd_keypaths.items():
-                second_psbt.inputs[0].hd_keypaths[pubkey] = KeyOriginInfo(b"\x00\x00\x00\x00", path.path)
+                second_psbt.inputs[0].hd_keypaths[pubkey] = KeyOriginInfo(b"\x00\x00\x00\x01", path.path)
 
             single_input = len(first_psbt.inputs) == 1
 
@@ -312,11 +314,16 @@ class TestSignTx(DeviceTestCase):
 
             # First will always have something to sign
             first_sign_res = self.do_command(self.dev_args + ['signtx', first_psbt])
+            self.assertTrue(first_sign_res["signed"])
             self.assertTrue(single_input == self.wrpc.finalizepsbt(first_sign_res['psbt'])['complete'])
             # Second may have nothing to sign (1 input case)
             # and also may throw an error(e.g., ColdCard)
             second_sign_res = self.do_command(self.dev_args + ['signtx', second_psbt])
             if 'psbt' in second_sign_res:
+                if single_input:
+                    self.assertFalse(second_sign_res["signed"])
+                else:
+                    self.assertTrue(second_sign_res["signed"])
                 self.assertTrue(not self.wrpc.finalizepsbt(second_sign_res['psbt'])['complete'])
                 combined_psbt = self.wrpc.combinepsbt([first_sign_res['psbt'], second_sign_res['psbt']])
 

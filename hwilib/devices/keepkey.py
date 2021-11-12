@@ -34,6 +34,7 @@ py_enumerate = enumerate # Need to use the enumerate built-in but there's anothe
 
 KEEPKEY_HID_IDS = {(0x2B24, 0x0001)}
 KEEPKEY_WEBUSB_IDS = {(0x2B24, 0x0002)}
+KEEPKEY_SIMULATOR_PATH = '127.0.0.1:11044'
 
 HID_IDS.update(KEEPKEY_HID_IDS)
 WEBUSB_IDS.update(KEEPKEY_WEBUSB_IDS)
@@ -145,7 +146,7 @@ class KeepkeyClient(TrezorClient):
 
         As Keepkeys are clones of the Trezor 1, please refer to `TrezorClient` for documentation.
         """
-        super(KeepkeyClient, self).__init__(path, password, expert)
+        super(KeepkeyClient, self).__init__(path, password, expert, KEEPKEY_HID_IDS, KEEPKEY_WEBUSB_IDS, KEEPKEY_SIMULATOR_PATH)
         self.type = 'Keepkey'
         self.client.vendors = ("keepkey.com")
         self.client.minimum_versions = {"K1-14AM": (0, 0, 0)}
@@ -159,7 +160,7 @@ def enumerate(password: str = "") -> List[Dict[str, Any]]:
     results = []
     devs = hid.HidTransport.enumerate(usb_ids=KEEPKEY_HID_IDS)
     devs.extend(webusb.WebUsbTransport.enumerate(usb_ids=KEEPKEY_WEBUSB_IDS))
-    devs.extend(udp.UdpTransport.enumerate())
+    devs.extend(udp.UdpTransport.enumerate(KEEPKEY_SIMULATOR_PATH))
     for dev in devs:
         d_data: Dict[str, Any] = {}
 
@@ -178,7 +179,8 @@ def enumerate(password: str = "") -> List[Dict[str, Any]]:
             if 'keepkey' not in client.client.features.vendor:
                 continue
 
-            if d_data['path'] == 'udp:127.0.0.1:21324':
+            d_data['label'] = client.client.features.label
+            if d_data['path'].startswith('udp:'):
                 d_data['model'] += '_simulator'
 
             d_data['needs_pin_sent'] = client.client.features.pin_protection and not client.client.features.unlocked

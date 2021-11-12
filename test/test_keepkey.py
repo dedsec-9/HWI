@@ -48,7 +48,7 @@ class KeepkeyEmulator(DeviceEmulator):
         # Wait for emulator to be up
         # From https://github.com/trezor/trezor-firmware/blob/master/legacy/script/wait_for_emulator.py
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.connect(('127.0.0.1', 21324))
+        sock.connect(('127.0.0.1', 11044))
         sock.settimeout(0)
         while True:
             try:
@@ -60,7 +60,7 @@ class KeepkeyEmulator(DeviceEmulator):
                 time.sleep(0.05)
 
         # Setup the emulator
-        wirelink = UdpTransport.enumerate()[0]
+        wirelink = UdpTransport.enumerate("127.0.0.1:11044")[0]
         client = TrezorClientDebugLink(wirelink)
         client.vendors = ("keepkey.com")
         client.minimum_versions = {"K1-14AM": (0, 0, 0)}
@@ -84,6 +84,9 @@ class KeepkeyEmulator(DeviceEmulator):
 
         if self.keepkey_log is not None:
             self.keepkey_log.close()
+
+        # Wait a second for everything to be cleaned up before going to the next test
+        time.sleep(1)
 
         atexit.unregister(self.stop)
 
@@ -146,16 +149,16 @@ class TestKeepkeyGetxpub(KeepkeyTestCase):
                 load_device_by_mnemonic(client=self.client, mnemonic=vec['mnemonic'], pin='', passphrase_protection=False, label='test', language='english')
 
                 # Test getmasterxpub
-                gmxp_res = self.do_command(['-t', 'keepkey', '-d', 'udp:127.0.0.1:21324', 'getmasterxpub', "--addr-type", "legacy"])
+                gmxp_res = self.do_command(['-t', 'keepkey', '-d', 'udp:127.0.0.1:11044', 'getmasterxpub', "--addr-type", "legacy"])
                 self.assertEqual(gmxp_res['xpub'], vec['master_xpub'])
 
                 # Test the path derivs
                 for path_vec in vec['vectors']:
-                    gxp_res = self.do_command(['-t', 'keepkey', '-d', 'udp:127.0.0.1:21324', 'getxpub', path_vec['path']])
+                    gxp_res = self.do_command(['-t', 'keepkey', '-d', 'udp:127.0.0.1:11044', 'getxpub', path_vec['path']])
                     self.assertEqual(gxp_res['xpub'], path_vec['xpub'])
 
     def test_expert_getxpub(self):
-        result = self.do_command(['-t', 'keepkey', '-d', 'udp:127.0.0.1:21324', '--expert', 'getxpub', 'm/44h/0h/0h/3'])
+        result = self.do_command(['-t', 'keepkey', '-d', 'udp:127.0.0.1:11044', '--expert', 'getxpub', 'm/44h/0h/0h/3'])
         self.assertEqual(result['xpub'], 'xpub6FMafWAi3n3ET2rU5yQr16UhRD1Zx4dELmcEw3NaYeBaNnipcr2zjzYp1sNdwR3aTN37hxAqRWQ13AWUZr6L9jc617mU6EvgYXyBjXrEhgr')
         self.assertFalse(result['testnet'])
         self.assertFalse(result['private'])
@@ -169,7 +172,7 @@ class TestKeepkeyGetxpub(KeepkeyTestCase):
 class TestKeepkeyManCommands(KeepkeyTestCase):
     def setUp(self):
         self.client = self.emulator.start()
-        self.dev_args = ['-t', 'keepkey', '-d', 'udp:127.0.0.1:21324']
+        self.dev_args = ['-t', 'keepkey', '-d', 'udp:127.0.0.1:11044']
 
     def test_setup_wipe(self):
         # Device is init, setup should fail
@@ -182,16 +185,34 @@ class TestKeepkeyManCommands(KeepkeyTestCase):
         self.assertTrue(result['success'])
 
         # Setup
-        t_client = KeepkeyClient('udp:127.0.0.1:21324', 'test')
+        t_client = KeepkeyClient('udp:127.0.0.1:11044', 'test')
         t_client.client.ui.get_pin = MethodType(get_pin, t_client.client.ui)
         t_client.client.ui.pin = '1234'
-        result = t_client.setup_device()
+        result = t_client.setup_device(label='HWI Keepkey')
         self.assertTrue(result)
 
         # Make sure device is init, setup should fail
         result = self.do_command(self.dev_args + ['-i', 'setup'])
         self.assertEquals(result['code'], -10)
         self.assertEquals(result['error'], 'Device is already initialized. Use wipe first and try again')
+
+    def test_label(self):
+        result = self.do_command(self.dev_args + ['wipe'])
+        self.assertTrue(result['success'])
+
+        t_client = KeepkeyClient('udp:127.0.0.1:11044', 'test')
+        t_client.client.ui.get_pin = MethodType(get_pin, t_client.client.ui)
+        t_client.client.ui.pin = '1234'
+        result = t_client.setup_device(label='HWI Keepkey')
+        self.assertTrue(result)
+
+        result = self.do_command(self.dev_args + ['enumerate'])
+        for dev in result:
+            if dev['type'] == 'keepkey' and dev['path'] == 'udp:127.0.0.1:11044':
+                self.assertEqual(dev['label'], 'HWI Keepkey')
+                break
+        else:
+            self.fail("Did not enumerate device")
 
     def test_backup(self):
         result = self.do_command(self.dev_args + ['backup'])
@@ -210,17 +231,23 @@ class TestKeepkeyManCommands(KeepkeyTestCase):
         self.assertEqual(result['code'], -11)
         result = self.do_command(self.dev_args + ['enumerate'])
         for dev in result:
-            if dev['type'] == 'trezor' and dev['path'] == 'udp:127.0.0.1:21324':
+            if dev['type'] == 'keepkey' and dev['path'] == 'udp:127.0.0.1:11044':
                 self.assertFalse(dev['needs_pin_sent'])
+                break
+        else:
+            self.fail("Did not enumerate device")
 
         # Set a PIN
         device.wipe(self.client)
-        load_device_by_mnemonic(client=self.client, mnemonic='alcohol woman abuse must during monitor noble actual mixed trade anger aisle', pin='1234', passphrase_protection=False, label='test')
+        load_device_by_mnemonic(client=self.client, mnemonic='alcohol woman abuse must during monitor noble actual mixed trade anger aisle', pin='1234', passphrase_protection=True, label='test')
         self.client.call(messages.LockDevice())
         result = self.do_command(self.dev_args + ['enumerate'])
         for dev in result:
-            if dev['type'] == 'trezor' and dev['path'] == 'udp:127.0.0.1:21324':
+            if dev['type'] == 'keepkey' and dev['path'] == 'udp:127.0.0.1:11044':
                 self.assertTrue(dev['needs_pin_sent'])
+                break
+        else:
+            self.fail("Did not enumerate device")
         result = self.do_command(self.dev_args + ['promptpin'])
         self.assertTrue(result['success'])
 
@@ -245,13 +272,16 @@ class TestKeepkeyManCommands(KeepkeyTestCase):
         # Send the PIN
         self.client.open()
         pin = self.client.debug.encode_pin('1234')
-        result = self.do_command(self.dev_args + ['sendpin', pin])
+        result = self.do_command(self.dev_args + ["-p", "test", 'sendpin', pin])
         self.assertTrue(result['success'])
 
         result = self.do_command(self.dev_args + ['enumerate'])
         for dev in result:
-            if dev['type'] == 'trezor' and dev['path'] == 'udp:127.0.0.1:21324':
+            if dev['type'] == 'keepkey' and dev['path'] == 'udp:127.0.0.1:11044':
                 self.assertFalse(dev['needs_pin_sent'])
+                break
+        else:
+            self.fail("Did not enumerate device")
 
         # Sending PIN after unlock
         result = self.do_command(self.dev_args + ['promptpin'])
@@ -268,27 +298,39 @@ class TestKeepkeyManCommands(KeepkeyTestCase):
         # A passphrase will need to be sent
         result = self.do_command(self.dev_args + ['enumerate'])
         for dev in result:
-            if dev['type'] == 'keepkey' and dev['path'] == 'udp:127.0.0.1:21324':
+            if dev['type'] == 'keepkey' and dev['path'] == 'udp:127.0.0.1:11044':
                 self.assertTrue(dev['needs_passphrase_sent'])
+                break
+        else:
+            self.fail("Did not enumerate device")
         result = self.do_command(self.dev_args + ['-p', 'pass', 'enumerate'])
         for dev in result:
-            if dev['type'] == 'keepkey' and dev['path'] == 'udp:127.0.0.1:21324':
+            if dev['type'] == 'keepkey' and dev['path'] == 'udp:127.0.0.1:11044':
                 self.assertFalse(dev['needs_passphrase_sent'])
                 fpr = dev['fingerprint']
+                break
+        else:
+            self.fail("Did not enumerate device")
         # A different passphrase will change the fingerprint
         result = self.do_command(self.dev_args + ['-p', 'pass2', 'enumerate'])
         for dev in result:
-            if dev['type'] == 'keepkey' and dev['path'] == 'udp:127.0.0.1:21324':
+            if dev['type'] == 'keepkey' and dev['path'] == 'udp:127.0.0.1:11044':
                 self.assertFalse(dev['needs_passphrase_sent'])
                 self.assertNotEqual(dev['fingerprint'], fpr)
+                break
+        else:
+            self.fail("Did not enumerate device")
 
         # Clearing the session and starting a new one with a new passphrase should change the passphrase
         self.client.call(messages.LockDevice())
         result = self.do_command(self.dev_args + ['-p', 'pass3', 'enumerate'])
         for dev in result:
-            if dev['type'] == 'keepkey' and dev['path'] == 'udp:127.0.0.1:21324':
+            if dev['type'] == 'keepkey' and dev['path'] == 'udp:127.0.0.1:11044':
                 self.assertFalse(dev['needs_passphrase_sent'])
                 self.assertNotEqual(dev['fingerprint'], fpr)
+                break
+        else:
+            self.fail("Did not enumerate device")
 
         # Disable passphrase
         self.do_command(self.dev_args + ['togglepassphrase'])
@@ -296,15 +338,21 @@ class TestKeepkeyManCommands(KeepkeyTestCase):
         # There's no passphrase
         result = self.do_command(self.dev_args + ['enumerate'])
         for dev in result:
-            if dev['type'] == 'keepkey' and dev['path'] == 'udp:127.0.0.1:21324':
+            if dev['type'] == 'keepkey' and dev['path'] == 'udp:127.0.0.1:11044':
                 self.assertFalse(dev['needs_passphrase_sent'])
                 self.assertEquals(dev['fingerprint'], '95d8f670')
+                break
+        else:
+            self.fail("Did not enumerate device")
         # Setting a passphrase won't change the fingerprint
         result = self.do_command(self.dev_args + ['-p', 'pass', 'enumerate'])
         for dev in result:
-            if dev['type'] == 'keepkey' and dev['path'] == 'udp:127.0.0.1:21324':
+            if dev['type'] == 'keepkey' and dev['path'] == 'udp:127.0.0.1:11044':
                 self.assertFalse(dev['needs_passphrase_sent'])
                 self.assertEquals(dev['fingerprint'], '95d8f670')
+                break
+        else:
+            self.fail("Did not enumerate device")
 
 def keepkey_test_suite(emulator, rpc, userpass, interface):
     # Redirect stderr to /dev/null as it's super spammy
@@ -313,7 +361,7 @@ def keepkey_test_suite(emulator, rpc, userpass, interface):
     # Device info for tests
     type = 'keepkey'
     full_type = 'keepkey'
-    path = 'udp:127.0.0.1:21324'
+    path = 'udp:127.0.0.1:11044'
     fingerprint = '95d8f670'
     master_xpub = 'xpub6D1weXBcFAo8CqBbpP4TbH5sxQH8ZkqC5pDEvJ95rNNBZC9zrKmZP2fXMuve7ZRBe18pWQQsGg68jkq24mZchHwYENd8cCiSb71u3KD4AFH'
     dev_emulator = KeepkeyEmulator(emulator)

@@ -12,6 +12,7 @@ from typing import (
     NoReturn,
     Optional,
     Sequence,
+    Set,
     Tuple,
     Union,
 )
@@ -48,6 +49,7 @@ from .._base58 import (
     get_xpub_fingerprint,
     to_address,
 )
+from .. import _base58 as base58
 
 from ..key import (
     ExtendedKey,
@@ -59,7 +61,12 @@ from .._script import (
     is_p2wsh,
     is_witness,
 )
-from ..psbt import PSBT
+from ..psbt import (
+    PSBT,
+    PartiallySignedInput,
+    PartiallySignedOutput,
+    KeyOriginInfo,
+)
 from ..tx import (
     CTxOut,
 )
@@ -69,6 +76,7 @@ from .._serialize import (
 from ..common import (
     AddressType,
     Chain,
+    hash256,
 )
 from .. import _bech32 as bech32
 from mnemonic import Mnemonic
@@ -93,7 +101,10 @@ Device = Union[hid.HidTransport, webusb.WebUsbTransport, udp.UdpTransport]
 
 
 # Only handles up to 15 of 15
-def parse_multisig(script: bytes) -> Tuple[bool, Optional[messages.MultisigRedeemScriptType]]:
+def parse_multisig(script: bytes, tx_xpubs: Dict[bytes, KeyOriginInfo], psbt_scope: Union[PartiallySignedInput, PartiallySignedOutput]) -> Tuple[bool, Optional[messages.MultisigRedeemScriptType]]:
+    # at least OP_M pub OP_N OP_CHECKMULTISIG
+    if len(script) < 37:
+        return (False, None)
     # Get m
     m = script[0] - 80
     if m < 1 or m > 15:
@@ -122,6 +133,19 @@ def parse_multisig(script: bytes) -> Tuple[bool, Optional[messages.MultisigRedee
     if op_cms != 174:
         return (False, None)
 
+    # check if we know corresponding xpubs from global scope
+    for pub in pubkeys:
+        if pub.node.public_key in psbt_scope.hd_keypaths:
+            derivation = psbt_scope.hd_keypaths[pub.node.public_key]
+            for xpub in tx_xpubs:
+                hd = ExtendedKey.deserialize(base58.encode(xpub + hash256(xpub)[:4]))
+                origin = tx_xpubs[xpub]
+                # check fingerprint and derivation
+                if (origin.fingerprint == derivation.fingerprint) and (origin.path == derivation.path[:len(origin.path)]):
+                    # all good - populate node and break
+                    pub.address_n = list(derivation.path[len(origin.path):])
+                    pub.node = messages.HDNodeType(depth=hd.depth, fingerprint=int.from_bytes(hd.parent_fingerprint, 'big'), child_num=hd.child_num, chain_code=hd.chaincode, public_key=hd.pubkey)
+                    break
     # Build MultisigRedeemScriptType and return it
     multisig = messages.MultisigRedeemScriptType(m=m, signatures=[b''] * n, pubkeys=pubkeys)
     return (True, multisig)
@@ -221,12 +245,18 @@ class PassphraseUI:
 
 HID_IDS = {DEV_TREZOR1}
 WEBUSB_IDS = TREZORS.copy()
+SIMULATOR_PATH = "127.0.0.1:21324"
 
 
-def get_path_transport(path: str) -> Device:
-    devs = hid.HidTransport.enumerate(usb_ids=HID_IDS)
-    devs.extend(webusb.WebUsbTransport.enumerate(usb_ids=WEBUSB_IDS))
-    devs.extend(udp.UdpTransport.enumerate())
+def get_path_transport(
+    path: str,
+    hid_ids: Set[Tuple[int, int]],
+    webusb_ids: Set[Tuple[int, int]],
+    sim_path: str
+) -> Device:
+    devs = hid.HidTransport.enumerate(usb_ids=hid_ids)
+    devs.extend(webusb.WebUsbTransport.enumerate(usb_ids=webusb_ids))
+    devs.extend(udp.UdpTransport.enumerate(sim_path))
     for dev in devs:
         if path == dev.get_path():
             return dev
@@ -236,10 +266,18 @@ def get_path_transport(path: str) -> Device:
 # This class extends the HardwareWalletClient for Trezor specific things
 class TrezorClient(HardwareWalletClient):
 
-    def __init__(self, path: str, password: str = "", expert: bool = False) -> None:
+    def __init__(
+        self,
+        path: str,
+        password: str = "",
+        expert: bool = False,
+        hid_ids: Set[Tuple[int, int]] = HID_IDS,
+        webusb_ids: Set[Tuple[int, int]] = WEBUSB_IDS,
+        sim_path: str = SIMULATOR_PATH
+    ) -> None:
         super(TrezorClient, self).__init__(path, password, expert)
         self.simulator = False
-        transport = get_path_transport(path)
+        transport = get_path_transport(path, hid_ids, webusb_ids, sim_path)
         if path.startswith('udp'):
             logging.debug('Simulator found, using DebugLink')
             self.client = TrezorClientDebugLink(transport=transport)
@@ -369,7 +407,7 @@ class TrezorClient(HardwareWalletClient):
                     to_ignore.append(input_num)
 
                 # Check for multisig
-                is_ms, multisig = parse_multisig(scriptcode)
+                is_ms, multisig = parse_multisig(scriptcode, tx.xpub, psbt_in)
                 if is_ms:
                     # Add to txinputtype
                     txinputtype.multisig = multisig
@@ -448,25 +486,33 @@ class TrezorClient(HardwareWalletClient):
                     else:
                         raise BadArgumentError("Output is not an address")
 
-                # Add the derivation path for change, but only if there is exactly one derivation path
+                # Add the derivation path for change
                 psbt_out = tx.outputs[i]
-                if len(psbt_out.hd_keypaths) == 1:
-                    _, keypath = next(iter(psbt_out.hd_keypaths.items()))
-                    if keypath.fingerprint == master_fp:
-                        wit, ver, prog = out.is_witness()
-                        if out.is_p2pkh():
+                for _, keypath in psbt_out.hd_keypaths.items():
+                    if keypath.fingerprint != master_fp:
+                        continue
+                    wit, ver, prog = out.is_witness()
+                    if out.is_p2pkh():
+                        txoutput.address_n = keypath.path
+                        txoutput.address = None
+                    elif wit:
+                        txoutput.script_type = messages.OutputScriptType.PAYTOWITNESS
+                        txoutput.address_n = keypath.path
+                        txoutput.address = None
+                    elif out.is_p2sh() and psbt_out.redeem_script:
+                        wit, ver, prog = CTxOut(0, psbt_out.redeem_script).is_witness()
+                        if wit and len(prog) in [20, 32]:
+                            txoutput.script_type = messages.OutputScriptType.PAYTOP2SHWITNESS
                             txoutput.address_n = keypath.path
                             txoutput.address = None
-                        elif wit:
-                            txoutput.script_type = messages.OutputScriptType.PAYTOWITNESS
-                            txoutput.address_n = keypath.path
-                            txoutput.address = None
-                        elif out.is_p2sh() and psbt_out.redeem_script:
-                            wit, ver, prog = CTxOut(0, psbt_out.redeem_script).is_witness()
-                            if wit and len(prog) == 20:
-                                txoutput.script_type = messages.OutputScriptType.PAYTOP2SHWITNESS
-                                txoutput.address_n = keypath.path
-                                txoutput.address = None
+
+                # add multisig info
+                if psbt_out.witness_script or psbt_out.redeem_script:
+                    is_ms, multisig = parse_multisig(
+                        psbt_out.witness_script or psbt_out.redeem_script,
+                        tx.xpub, psbt_out)
+                    if is_ms:
+                        txoutput.multisig = multisig
 
                 # append to outputs
                 outputs.append(txoutput)
@@ -631,7 +677,7 @@ class TrezorClient(HardwareWalletClient):
 
         if self.client.features.initialized:
             raise DeviceAlreadyInitError('Device is already initialized. Use wipe first and try again')
-        device.reset(self.client, passphrase_protection=bool(self.password))
+        device.reset(self.client, label=label or None, passphrase_protection=bool(self.password))
         return True
 
     @trezor_exception
@@ -647,7 +693,7 @@ class TrezorClient(HardwareWalletClient):
             # Use interactive_get_pin
             self.client.ui.get_pin = MethodType(interactive_get_pin, self.client.ui)
 
-        device.recover(self.client, word_count=word_count, label=label, input_callback=mnemonic_words(), passphrase_protection=bool(self.password))
+        device.recover(self.client, word_count=word_count, label=label or None, input_callback=mnemonic_words(), passphrase_protection=bool(self.password))
         return True
 
     def backup_device(self, label: str = "", passphrase: str = "") -> bool:
@@ -691,7 +737,7 @@ class TrezorClient(HardwareWalletClient):
                     raise DeviceAlreadyUnlockedError('The PIN has already been sent to this device')
             return False
         elif isinstance(resp, messages.PassphraseRequest):
-            pass_resp = self.client.call_raw(messages.PassphraseAck(passphrase=self.client.ui.get_passphrase(available_on_device=False), on_device=False))
+            pass_resp = self.client.call(messages.PassphraseAck(passphrase=self.client.ui.get_passphrase(available_on_device=False), on_device=False), check_fw=False)
             if isinstance(pass_resp, messages.Deprecated_PassphraseStateRequest):
                 self.client.call_raw(messages.Deprecated_PassphraseStateAck())
         return True
@@ -729,8 +775,9 @@ def enumerate(password: str = "") -> List[Dict[str, Any]]:
             if 'trezor' not in client.client.features.vendor:
                 continue
 
+            d_data['label'] = client.client.features.label
             d_data['model'] = 'trezor_' + client.client.features.model.lower()
-            if d_data['path'] == 'udp:127.0.0.1:21324':
+            if d_data['path'].startswith('udp:'):
                 d_data['model'] += '_simulator'
 
             d_data['needs_pin_sent'] = client.client.features.pin_protection and not client.client.features.unlocked
