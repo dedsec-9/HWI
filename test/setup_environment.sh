@@ -22,6 +22,10 @@ while [[ $# -gt 0 ]]; do
         build_ledger=1
         shift
         ;;
+        --ledger-legacy)
+        build_ledger=1
+        shift
+        ;;
         --keepkey)
         build_keepkey=1
         shift
@@ -136,11 +140,7 @@ if [[ -n ${build_coldcard} ]]; then
     fi
     # Apply patch to make simulator work in linux environments
     git am ../../data/coldcard-multisig.patch
-
-    # Apply patch to libngu to make it compile
-    pushd external/libngu
-    git am ../../../../data/coldcard-libngu.patch
-    popd
+    git am ../../data/coldcard-ffilib.patch
 
     # Build the simulator. This is cached, but it is also fast
     poetry run pip install -r requirements.txt
@@ -181,7 +181,7 @@ if [[ -n ${build_bitbox01} ]]; then
 
     # Build the simulator. This is cached, but it is also fast
     mkdir -p build && cd build
-    cmake .. -DBUILD_TYPE=simulator -DCMAKE_C_FLAGS="-Wno-format-truncation"
+    cmake .. -DBUILD_TYPE=simulator -DCMAKE_C_FLAGS="-Wno-format-truncation -Wno-array-parameter"
     make
     cd ../..
 fi
@@ -218,6 +218,7 @@ if [[ -n ${build_keepkey} ]]; then
 
     # Build the simulator. This is cached, but it is also fast
     if [ "$keepkey_setup_needed" == true ] ; then
+        git clean -ffdx
         git clone https://github.com/nanopb/nanopb.git -b nanopb-0.3.9.4
     fi
     cd nanopb/generator/proto
@@ -300,12 +301,37 @@ if [[ -n ${build_jade} ]]; then
     if [ ! -d "qemu" ]; then
         git clone --depth 1 --branch ${ESP_QEMU_BRANCH} --single-branch --recursive https://github.com/espressif/qemu.git ./qemu
         cd qemu
-        ./configure --target-list=xtensa-softmmu \
+        ./configure \
+            --target-list=xtensa-softmmu \
             --enable-gcrypt \
-            --enable-debug --enable-sanitizers \
-            --disable-strip --disable-user \
-            --disable-capstone --disable-vnc \
-            --disable-sdl --disable-gtk
+            --disable-user \
+            --disable-opengl \
+            --disable-curses \
+            --disable-capstone \
+            --disable-vnc \
+            --disable-parallels \
+            --disable-qed \
+            --disable-vvfat \
+            --disable-vdi \
+            --disable-qcow1 \
+            --disable-dmg \
+            --disable-cloop \
+            --disable-bochs \
+            --disable-replication \
+            --disable-live-block-migration \
+            --disable-keyring \
+            --disable-containers \
+            --disable-docs \
+            --disable-libssh \
+            --disable-xen \
+            --disable-tools \
+            --disable-zlib-test \
+            --disable-sdl \
+            --disable-gtk \
+            --disable-vhost-scsi \
+            --disable-qom-cast-debug \
+            --disable-tpm \
+            --extra-cflags=-Wno-array-parameter
     else
         cd qemu
         git fetch
@@ -316,6 +342,8 @@ if [[ -n ${build_jade} ]]; then
     cd ..
 
     # Build the esp-idf toolchain
+    # We will install the esp-idf tools in a given location (otherwise defaults to user home dir)
+    export IDF_TOOLS_PATH="$(pwd)/esp-idf-tools"
     if [ ! -d "esp-idf" ]; then
         git clone --depth=1 --branch ${ESP_IDF_BRANCH} --single-branch --recursive https://github.com/espressif/esp-idf.git ./esp-idf
         cd esp-idf
@@ -326,9 +354,8 @@ if [[ -n ${build_jade} ]]; then
     git checkout ${ESP_IDF_COMMIT}
     git submodule update --recursive --init
 
-    # Install the isp-idf tools in a given location (otherwise defauts to user home dir)
-    IDF_TOOLS_PATH=$(pwd)/tools
-    ./install.sh
+    # Only install the tools we need (ie. esp32)
+    ./install.sh esp32
     . ./export.sh
     cd ..
 
@@ -367,6 +394,7 @@ if [[ -n ${build_bitcoind} ]]; then
         bitcoind_setup_needed=true
     else
         cd bitcoin
+        git reset --hard origin/master
         git fetch
 
         # Determine if we need to pull. From https://stackoverflow.com/a/3278427
@@ -387,6 +415,11 @@ if [[ -n ${build_bitcoind} ]]; then
     pushd depends
     make NO_QT=1 NO_QR=1 NO_ZMQ=1 NO_UPNP=1 NO_NATPMP=1
     popd
+
+    # Apply Taproot PSBT and PSBTv2 fields patch
+    git am ../../data/bitcoind_taproot_psbt2.patch
+
+    # Do the build
     ./autogen.sh
     CONFIG_SITE=$PWD/depends/x86_64-pc-linux-gnu/share/config.site ./configure --with-incompatible-bdb --with-miniupnpc=no --without-gui --disable-zmq --disable-tests --disable-bench --with-libs=no --with-utils=no
     make src/bitcoind
